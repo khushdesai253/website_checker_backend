@@ -3,7 +3,20 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const cors = require('cors');
 const puppeteer = require('puppeteer');
+const fs = require('fs');
+const path = require('path');
+const Groq = require('groq-sdk');
 require('dotenv').config();
+
+// Load WABA guide once at startup
+const WABA_GUIDE = fs.readFileSync(path.join(__dirname, 'waba_guide.md'), 'utf8');
+
+// Groq client (lazy — only used if GROQ_API_KEY is set)
+function getGroqClient() {
+  const key = process.env.GROQ_API_KEY;
+  if (!key || key === 'your_groq_api_key_here') throw new Error('GROQ_API_KEY not set in .env');
+  return new Groq({ apiKey: key });
+}
 
 let browser;
 
@@ -55,6 +68,74 @@ function normalizeUrl(url) {
   return url.trim();
 }
 
+// ─── Input Validation ────────────────────────────────────────────────────────
+function validateInputs({ url, email, displayName, legalName, phone }) {
+  const errors = {};
+
+  // URL: required + must be a valid URL after normalization
+  if (!url || !url.trim()) {
+    errors.url = 'URL is required.';
+  } else {
+    const normalized = normalizeUrl(url.trim());
+    try {
+      new URL(normalized);
+    } catch {
+      errors.url = 'Invalid URL format. Example: https://example.com';
+    }
+  }
+
+  // Email: optional but must be valid if provided
+  if (email && email.trim()) {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email.trim())) {
+      errors.email = 'Invalid email format. Example: contact@example.com';
+    }
+  }
+
+  // Display Name: optional, but validated if provided
+  if (displayName && displayName.trim()) {
+    const dn = displayName.trim();
+    const genericTerms = ['and', 'or', 'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'with', 'is', 'are', 'am'];
+
+    if (dn.length < 3) {
+      errors.displayName = 'Display name must be at least 3 characters long.';
+    } else if (dn.length > 60) {
+      errors.displayName = 'Display name must be 60 characters or fewer.';
+    } else if (/^https?:\/\//i.test(dn) || /\.(com|net|org|io|co)\b/i.test(dn)) {
+      errors.displayName = 'Display name cannot be a URL or web address.';
+    } else if (/whatsapp/i.test(dn)) {
+      errors.displayName = 'Display name cannot contain the word "WhatsApp" (Meta policy).';
+    } else if (dn === dn.toUpperCase() && /[A-Z]{2,}/.test(dn)) {
+      errors.displayName = 'Display name cannot be ALL CAPS (Meta policy requires standard capitalization).';
+    } else if (genericTerms.includes(dn.toLowerCase())) {
+      errors.displayName = `Meta Policy Violation: "${dn}" is a generic term. Display names must represent your business faithfully and cannot consist entirely of generic words (e.g., "Shoes", "and") or just geographic locations.`;
+    }
+  }
+
+  // Legal Name: optional, but validated if provided
+  if (legalName && legalName.trim()) {
+    const ln = legalName.trim();
+    if (ln.length < 2) {
+      errors.legalName = 'Legal name must be at least 2 characters long.';
+    } else if (ln.length > 100) {
+      errors.legalName = 'Legal name must be 100 characters or fewer.';
+    }
+  }
+
+  // Phone Number: optional, but validated if provided
+  if (phone && phone.trim()) {
+    const p = phone.replace(/[^0-9+]/g, '');
+    if (p.length < 10) {
+      errors.phone = 'Phone number is too short. Ensure it includes the country code.';
+    }
+  }
+
+  return {
+    valid: Object.keys(errors).length === 0,
+    errors
+  };
+}
+
 function extractBaseUrl(url) {
   try {
     const parsed = new URL(url);
@@ -98,7 +179,7 @@ function checkDomainMatch(siteUrl, email) {
 function checkDisplayName($, displayName) {
   if (!displayName) return { match: false, error: 'No display name provided' };
   const dn = displayName.toLowerCase().trim();
-  
+
   // Only check header and footer text
   const headerText = $('header').text().toLowerCase();
   const footerText = $('footer').text().toLowerCase();
@@ -141,10 +222,10 @@ function checkLegalName($, legalName) {
   const ln = legalName.toLowerCase().trim();
   const bodyText = $('body').text().toLowerCase();
   const footerText = $('footer').text().toLowerCase();
-  
+
   // 1. Look for legal name near copyright symbols or "Copyright" text
   const copyrightIndex = bodyText.indexOf('©') !== -1 ? bodyText.indexOf('©') : bodyText.indexOf('copyright');
-  
+
   let proximityMatch = false;
   let snippet = '';
 
@@ -167,7 +248,7 @@ function checkLegalName($, legalName) {
   const hasSuffixMatch = (txt, target) => {
     const index = txt.indexOf(target);
     if (index === -1) return false;
-    
+
     // Get text after the match
     const after = txt.substring(index + target.length).trim().toLowerCase();
     // Check if it starts with any common suffixes (with or without a dot)
@@ -175,7 +256,7 @@ function checkLegalName($, legalName) {
   };
 
   let strictMatch = (proximityMatch || inFooter);
-  
+
   if (strictMatch) {
     // If the user's input doesn't already contain a suffix, 
     // but the found text in the site does, then it's NOT an exact match.
@@ -345,10 +426,12 @@ async function checkPage(type, baseUrl, $mainPage, mainHtml) {
 }
 
 app.post('/api/check', async (req, res) => {
-  let { url, email, displayName, legalName } = req.body;
+  let { url, email, displayName, legalName, phone } = req.body;
 
-  if (!url) {
-    return res.status(400).json({ error: 'URL is required' });
+  // Validate inputs before any network requests
+  const validation = validateInputs({ url, email, displayName, legalName, phone });
+  if (!validation.valid) {
+    return res.status(400).json({ error: 'Validation failed', validationErrors: validation.errors });
   }
 
   url = normalizeUrl(url);
@@ -387,7 +470,11 @@ app.post('/api/check', async (req, res) => {
   const verification = {
     domainEmail: checkDomainMatch(url, email),
     displayName: checkDisplayName($main, displayName),
-    legalName: checkLegalName($main, legalName)
+    legalName: checkLegalName($main, legalName),
+    whatsappActive: phone && phone.trim() ? {
+      match: true,
+      link: `https://wa.me/${phone.replace(/[^0-9]/g, '')}`
+    } : null
   };
 
   return res.status(200).json({
@@ -404,6 +491,112 @@ app.post('/api/check', async (req, res) => {
     },
     verification
   });
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// NEW: /api/waba-check  — runs the same scraping as /api/check, then asks
+// Groq to evaluate the results against the WABA onboarding guide.
+// ──────────────────────────────────────────────────────────────────────────────
+app.post('/api/waba-check', async (req, res) => {
+  let { url, email, displayName, legalName, phone } = req.body;
+
+  // Validate inputs before any network requests
+  const validation = validateInputs({ url, email, displayName, legalName, phone });
+  if (!validation.valid) {
+    return res.status(400).json({ error: 'Validation failed', validationErrors: validation.errors });
+  }
+
+  // ── 1. Run the same checks as /api/check ──────────────────────────────────
+  url = normalizeUrl(url);
+  const isHttps = url.startsWith('https://');
+
+  const mainResult = await fetchPage(url);
+  if (!mainResult.success) {
+    return res.status(200).json({
+      url, isHttps, mainPageAccessible: false,
+      error: mainResult.error, checks: {}, groqAnalysis: null
+    });
+  }
+
+  const baseUrl = extractBaseUrl(url);
+  const $main = cheerio.load(mainResult.data);
+  const copyrightName = extractCopyright($main);
+
+  const [termsResult, privacyResult, aboutResult, contactResult, homeResult] = await Promise.all([
+    checkPage('terms', baseUrl, $main, mainResult.data),
+    checkPage('privacy', baseUrl, $main, mainResult.data),
+    checkPage('about', baseUrl, $main, mainResult.data),
+    checkPage('contact', baseUrl, $main, mainResult.data),
+    checkPage('home', baseUrl, $main, mainResult.data)
+  ]);
+
+  const verification = {
+    domainEmail: checkDomainMatch(url, email),
+    displayName: checkDisplayName($main, displayName),
+    legalName: checkLegalName($main, legalName),
+    whatsappActive: phone && phone.trim() ? {
+      match: true,
+      link: `https://wa.me/${phone.replace(/[^0-9]/g, '')}`
+    } : null
+  };
+
+  const checkData = {
+    url, isHttps,
+    mainPageAccessible: true,
+    copyrightName,
+    checks: {
+      home: homeResult,
+      termsAndConditions: termsResult,
+      privacyPolicy: privacyResult,
+      aboutUs: aboutResult,
+      contactUs: contactResult
+    },
+    verification
+  };
+
+  // ── 2. Send to Groq for WABA compliance analysis ──────────────────────────
+  let groqAnalysis = null;
+  try {
+    const groq = getGroqClient();
+
+    const prompt = `You are a Meta WhatsApp Business API (WABA) onboarding compliance expert.
+
+Below is the WABA Onboarding & Compliance Guide:
+───────────────────────────────────────────────
+${WABA_GUIDE}
+───────────────────────────────────────────────
+
+Below is the automated website scan result for the business website:
+${JSON.stringify(checkData, null, 2)}
+
+Additional user-provided info:
+- Display Name: ${displayName || 'Not provided'}
+- Legal Name: ${legalName || 'Not provided'}
+- Contact Email: ${email || 'Not provided'}
+- Phone Number: ${phone || 'Not provided'}
+
+Based on the guide and the scan results, provide a structured WABA compliance report with:
+1. ✅ PASSED checks (with brief explanation)
+2. ❌ FAILED checks (with clear reason)
+3. ⚠️ WARNINGS / items that need manual verification
+4. 📋 OVERALL VERDICT: Ready for WABA Submission | Needs Fixes Before Submission
+5. 🔧 Next Steps: A short prioritized action list
+
+Be concise, factual, and actionable.`;
+
+    const completion = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.3,
+      max_tokens: 2048
+    });
+
+    groqAnalysis = completion.choices[0]?.message?.content || null;
+  } catch (err) {
+    groqAnalysis = `Groq analysis unavailable: ${err.message}`;
+  }
+
+  return res.status(200).json({ ...checkData, groqAnalysis });
 });
 
 app.get('/health', (req, res) => {
