@@ -6,6 +6,7 @@ const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
 const Groq = require('groq-sdk');
+const nodemailer = require('nodemailer');
 require('dotenv').config();
 
 // Load WABA guide once at startup
@@ -597,6 +598,128 @@ Be concise, factual, and actionable.`;
   }
 
   return res.status(200).json({ ...checkData, groqAnalysis });
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Send Report to Account Manager via SMTP
+// ──────────────────────────────────────────────────────────────────────────────
+app.post('/api/send-report', async (req, res) => {
+  const { amEmail, amName, reportData } = req.body;
+
+  if (!amEmail || !reportData) {
+    return res.status(400).json({ error: 'Account Manager email and report data are required.' });
+  }
+
+  // Build HTML email
+  const score = reportData.score || 'N/A';
+  const checks = reportData.checks || {};
+  const verification = reportData.verification || {};
+
+  const checkRows = Object.entries(checks).map(([key, data]) => {
+    const labels = {
+      home: 'Home Page',
+      termsAndConditions: 'Terms & Conditions',
+      privacyPolicy: 'Privacy Policy',
+      aboutUs: 'About Us',
+      contactUs: 'Contact Us'
+    };
+    const found = data && data.found;
+    const statusColor = found ? '#10b981' : '#ef4444';
+    const statusText = found ? '✓ Found' : '✗ Not Found';
+    const url = data && data.url ? data.url : '-';
+    return `<tr>
+      <td style="padding:10px 14px;border-bottom:1px solid #e2e8f0;font-size:14px;">${labels[key] || key}</td>
+      <td style="padding:10px 14px;border-bottom:1px solid #e2e8f0;font-size:14px;color:${statusColor};font-weight:600;">${statusText}</td>
+      <td style="padding:10px 14px;border-bottom:1px solid #e2e8f0;font-size:12px;color:#64748b;word-break:break-all;">${url}</td>
+    </tr>`;
+  }).join('');
+
+  const verificationRows = [
+    { label: 'Domain Email', data: verification.domainEmail },
+    { label: 'Display Name', data: verification.displayName },
+    { label: 'Legal Name', data: verification.legalName }
+  ].map(v => {
+    const match = v.data && v.data.match;
+    const color = match ? '#10b981' : '#ef4444';
+    const text = match ? '✓ Match' : '✗ No Match';
+    return `<tr>
+      <td style="padding:10px 14px;border-bottom:1px solid #e2e8f0;font-size:14px;">${v.label}</td>
+      <td style="padding:10px 14px;border-bottom:1px solid #e2e8f0;font-size:14px;color:${color};font-weight:600;">${text}</td>
+    </tr>`;
+  }).join('');
+
+  const htmlBody = `
+  <div style="font-family:'Segoe UI',Arial,sans-serif;max-width:650px;margin:0 auto;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.08);">
+    <div style="background:linear-gradient(135deg,#3b82f6,#8b5cf6);padding:28px 32px;">
+      <h1 style="margin:0;color:#fff;font-size:22px;font-weight:700;">🔍 Website Verification Report</h1>
+      <p style="margin:6px 0 0;color:rgba(255,255,255,0.85);font-size:14px;">Auto-generated compliance report</p>
+    </div>
+    <div style="padding:28px 32px;">
+      <div style="background:#f8fafc;border-radius:8px;padding:16px 20px;margin-bottom:24px;border-left:4px solid #3b82f6;">
+        <p style="margin:0 0 6px;font-size:13px;color:#64748b;">Analyzed URL</p>
+        <p style="margin:0;font-size:16px;font-weight:600;color:#1e293b;">${reportData.url || 'N/A'}</p>
+        <p style="margin:8px 0 0;font-size:13px;">
+          <span style="color:${reportData.isHttps ? '#10b981' : '#ef4444'};font-weight:600;">
+            ${reportData.isHttps ? '🔒 HTTPS Secure' : '⚠️ Not HTTPS'}
+          </span>
+          &nbsp;&nbsp;|&nbsp;&nbsp;
+          <span style="color:#64748b;">Score: <strong style="color:#1e293b;">${score}%</strong></span>
+        </p>
+        ${reportData.copyrightName ? `<p style="margin:8px 0 0;font-size:13px;color:#64748b;">© ${reportData.copyrightName}</p>` : ''}
+      </div>
+
+      <h2 style="font-size:15px;font-weight:700;color:#1e293b;margin:0 0 12px;text-transform:uppercase;letter-spacing:1px;">Page Checks</h2>
+      <table style="width:100%;border-collapse:collapse;margin-bottom:24px;">
+        <thead>
+          <tr style="background:#f1f5f9;">
+            <th style="padding:10px 14px;text-align:left;font-size:12px;color:#64748b;font-weight:600;text-transform:uppercase;">Page</th>
+            <th style="padding:10px 14px;text-align:left;font-size:12px;color:#64748b;font-weight:600;text-transform:uppercase;">Status</th>
+            <th style="padding:10px 14px;text-align:left;font-size:12px;color:#64748b;font-weight:600;text-transform:uppercase;">URL</th>
+          </tr>
+        </thead>
+        <tbody>${checkRows}</tbody>
+      </table>
+
+      <h2 style="font-size:15px;font-weight:700;color:#1e293b;margin:0 0 12px;text-transform:uppercase;letter-spacing:1px;">Verification Results</h2>
+      <table style="width:100%;border-collapse:collapse;margin-bottom:24px;">
+        <thead>
+          <tr style="background:#f1f5f9;">
+            <th style="padding:10px 14px;text-align:left;font-size:12px;color:#64748b;font-weight:600;text-transform:uppercase;">Check</th>
+            <th style="padding:10px 14px;text-align:left;font-size:12px;color:#64748b;font-weight:600;text-transform:uppercase;">Result</th>
+          </tr>
+        </thead>
+        <tbody>${verificationRows}</tbody>
+      </table>
+
+      <div style="background:#f8fafc;border-radius:8px;padding:14px 20px;text-align:center;">
+        <p style="margin:0;font-size:12px;color:#94a3b8;">This report was sent from the Form Validation Tool</p>
+      </div>
+    </div>
+  </div>`;
+
+  try {
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST || 'smtp.gmail.com',
+      port: parseInt(process.env.SMTP_PORT || '587'),
+      secure: false,
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS
+      }
+    });
+
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: amEmail,
+      subject: `Website Verification Report — ${reportData.url || 'Unknown'}`,
+      html: htmlBody
+    });
+
+    return res.status(200).json({ success: true, message: `Report sent to ${amName || amEmail}` });
+  } catch (err) {
+    console.error('Email send error:', err);
+    return res.status(500).json({ error: `Failed to send email: ${err.message}` });
+  }
 });
 
 app.get('/health', (req, res) => {
