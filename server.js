@@ -722,6 +722,72 @@ app.post('/api/send-report', async (req, res) => {
   }
 });
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Lead Capture → Zoho CRM
+// ──────────────────────────────────────────────────────────────────────────────
+app.post('/api/capture-lead', async (req, res) => {
+  const { firstName, lastName, email, phone } = req.body;
+
+  // All four fields are mandatory
+  if (!firstName || !firstName.trim()) return res.status(400).json({ error: 'First Name is required.' });
+  if (!lastName || !lastName.trim()) return res.status(400).json({ error: 'Last Name is required.' });
+  if (!email || !email.trim()) return res.status(400).json({ error: 'Email is required.' });
+  if (!phone || !phone.trim()) return res.status(400).json({ error: 'Phone Number is required.' });
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email.trim())) {
+    return res.status(400).json({ error: 'Invalid email format.' });
+  }
+
+  try {
+    // ── Step 1: Generate Zoho access token ────────────────────────────────────
+    const tokenUrl = `https://accounts.zoho.in/oauth/v2/token?refresh_token=${process.env.ZOHO_REFRESH_TOKEN}&client_id=${process.env.ZOHO_CLIENT_ID}&client_secret=${process.env.ZOHO_CLIENT_SECRET}&grant_type=refresh_token`;
+
+    const tokenResp = await axios.post(tokenUrl);
+    const accessToken = tokenResp.data?.access_token;
+
+    if (!accessToken) {
+      console.error('Zoho token response:', tokenResp.data);
+      return res.status(500).json({ error: 'Failed to generate Zoho access token.' });
+    }
+
+    // ── Step 2: Create Lead in Zoho CRM ──────────────────────────────────────
+    const leadResp = await axios.post(
+      'https://www.zohoapis.in/crm/v2/Leads',
+      {
+        data: [
+          {
+            First_Name: firstName.trim(),
+            Last_Name: lastName.trim(),
+            Account_Manager: '*',
+            Phone: phone.trim(),
+            Email: email.trim()
+          }
+        ]
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Zoho-oauthtoken ${accessToken}`
+        }
+      }
+    );
+
+
+    return res.status(200).json({
+      success: true,
+      message: 'Lead captured successfully!',
+      zohoResponse: leadResp.data
+    });
+  } catch (err) {
+    console.error('Zoho lead capture error:', err.response?.data || err.message);
+    return res.status(500).json({
+      error: 'Failed to create lead in Zoho CRM.',
+      details: err.response?.data || err.message
+    });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', version: '2.0-AXIOS' });
 });
